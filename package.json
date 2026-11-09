@@ -1,0 +1,22 @@
+{
+  "name": "sketchy",
+  "version": "1.0.0",
+  "description": "A free, open-source drawing party game. Everyone draws on their phone, invents fake titles, and votes on the big screen.",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test",
+    "start": "npx --yes serve@14 -l 8080 ."
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "party-game",
+    "drawing",
+    "multiplayer",
+    "webrtc",
+    "peerjs",
+    "no-build"
+  ]
+}
