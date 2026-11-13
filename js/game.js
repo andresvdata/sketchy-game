@@ -37,18 +37,27 @@ const clampInt=(v,a,b)=>{v=Math.floor(Number(v));return Number.isFinite(v)?Math.
 const fmt=s=>Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
 
 /* ================= transport: direct browser-to-browser (PeerJS), no accounts ================= */
-let peer=null,roomState=(typeof window.Peer==='function')?'ok':'unavailable',live=false,lastPub='';
+// roomState: 'ok' | 'unavailable' (PeerJS didn't load) | 'nortc' (browser has no WebRTC, e.g. many smart TVs)
+let peer=null,live=false,lastPub='';
+let roomState=(typeof window.Peer!=='function')?'unavailable':(typeof window.RTCPeerConnection!=='function'||typeof window.WebSocket!=='function')?'nortc':'ok';
+// Diagnostics, so each screen can say *why* it isn't connected instead of a generic message.
+let hostFail=null,hostSince=0;            // host: last signalling error type, and when hosting started
+let netErr=null,netErrAt=0,connectAt=0;   // player: 'nogame' | 'direct' | 'broker' | 'browser', when, and when the last attempt began
 let MODE='home',S=null,P=null,homeKey='';
 const PEER_OPTS=window.SKETCHY_PEER||{debug:0};
 const hostIdFor=code=>'sketchy-party-v1-'+String(code).toLowerCase();
 const conns=new Map();
-let lastHostMsg=null,hostConn=null,retryTimer=null,hostRetry=null;
-function killPeer(){clearTimeout(retryTimer);clearTimeout(hostRetry);conns.clear();if(hostConn){try{hostConn.close();}catch(e){}}hostConn=null;if(peer){try{peer.destroy();}catch(e){}}peer=null;live=false;}
+let lastHostMsg=null,hostConn=null,retryTimer=null,hostRetry=null,attemptTimer=null;
+function killPeer(){clearTimeout(attemptTimer);hostFail=null;hostSince=0;netErr=null;connectAt=0;clearTimeout(retryTimer);clearTimeout(hostRetry);conns.clear();if(hostConn){try{hostConn.close();}catch(e){}}hostConn=null;if(peer){try{peer.destroy();}catch(e){}}peer=null;live=false;}
 function hostOpen(){
   if(roomState!=='ok')return;
+  const since=hostSince||Date.now(),fail=hostFail;
   killPeer();
-  const me=new Peer(hostIdFor(S.code),PEER_OPTS);peer=me;
-  me.on('open',()=>{if(peer!==me)return;live=true;lastPub='';hostPublish();update();});
+  hostSince=since;hostFail=fail;
+  let me;
+  try{me=new Peer(hostIdFor(S.code),PEER_OPTS);}catch(e){hostFail='browser-incompatible';update();return;}
+  peer=me;
+  me.on('open',()=>{if(peer!==me)return;live=true;hostFail=null;lastPub='';hostPublish();update();});
   me.on('connection',conn=>{
     conn.on('open',()=>{conns.set(conn.peer,{conn,pres:{}});if(lastHostMsg){try{conn.send(lastHostMsg);}catch(e){}}});
     conn.on('data',msg=>{
@@ -62,9 +71,12 @@ function hostOpen(){
   me.on('disconnected',()=>{if(peer!==me)return;live=false;update();clearTimeout(hostRetry);hostRetry=setTimeout(()=>{try{if(!me.destroyed)me.reconnect();}catch(e){}},1500);});
   me.on('error',err=>{
     if(peer!==me)return;
-    if(err&&err.type==='unavailable-id'){S.code=makeCode();hostOpen();update();return;}
+    // Code already taken. In an empty lobby just pick another; mid-game it's our own stale registration, so keep the code and retry below.
+    if(err&&err.type==='unavailable-id'&&S.phase==='lobby'&&!S.players.length){S.code=makeCode();hostOpen();update();return;}
     if(err&&err.type==='peer-unavailable')return;
-    live=false;update();clearTimeout(hostRetry);hostRetry=setTimeout(()=>{if(peer===me&&MODE==='host')hostOpen();},4000);
+    live=false;hostFail=(err&&err.type)||'unknown';update();
+    if(hostFail==='browser-incompatible')return; // retrying can't help
+    clearTimeout(hostRetry);hostRetry=setTimeout(()=>{if(peer===me&&MODE==='host')hostOpen();},4000);
   });
 }
 const peerList=()=>Array.from(conns.values()).map(e=>({presence:e.pres,sameTab:false,updatedAt:0}));
@@ -73,27 +85,65 @@ function pubHost(o){
   lastHostMsg={t:'h',pres:Object.assign({},o,{t:Date.now()})};
   conns.forEach(e=>{if(e.conn.open){try{e.conn.send(lastHostMsg);}catch(err){}}});
 }
+/*
+ * Player connection loop.
+ *
+ * Every attempt uses a brand-new Peer. The public PeerJS broker answers "no such peer" within a fraction
+ * of a second for a new peer's first offer, but stays silent for repeat offers from the same peer, so
+ * reusing one would leave the phone waiting forever after its first miss.
+ *
+ * Each attempt ends in exactly one of: connected, or fail(reason) with
+ *   'nogame'  - the broker has no host registered for this code
+ *   'direct'  - the host exists but a direct WebRTC link couldn't be opened (different networks, VPN, firewall)
+ *   'broker'  - this phone couldn't reach the broker at all
+ *   'browser' - this browser has no WebRTC (no retry)
+ */
 function playerConnect(){
-  clearTimeout(retryTimer);
+  clearTimeout(retryTimer);clearTimeout(attemptTimer);
   if(!P||!P.code||roomState!=='ok')return;
-  const go=()=>{
-    if(!peer||peer.destroyed||!P||!P.code)return;
-    if(hostConn){try{hostConn.close();}catch(e){}}
-    const c=peer.connect(hostIdFor(P.code),{reliable:true});hostConn=c;
-    c.on('open',()=>{if(hostConn!==c)return;live=true;try{c.send({t:'p',pres:P.pres});}catch(e){}update();});
-    c.on('data',msg=>{if(hostConn!==c||!msg||msg.t!=='h'||!msg.pres)return;playerOnPeers([{presence:msg.pres,updatedAt:Date.now()}]);});
-    const lost=()=>{if(hostConn!==c)return;hostConn=null;live=false;playerOnPeers([]);scheduleRetry();};
-    c.on('close',lost);c.on('error',lost);
+  if(hostConn){const old=hostConn;hostConn=null;try{old.close();}catch(e){}}
+  if(peer){const old=peer;peer=null;try{old.destroy();}catch(e){}}
+  live=false;
+  let me;
+  try{me=new Peer(PEER_OPTS);}catch(e){netErr='browser';netErrAt=Date.now();return;}
+  peer=me;let opened=false;
+  const fail=why=>{
+    if(peer!==me)return;
+    netErr=why;netErrAt=Date.now();clearTimeout(attemptTimer);
+    hostConn=null;live=false;peer=null;try{me.destroy();}catch(e){}
+    playerOnPeers([]);
+    if(why!=='browser')scheduleRetry();
   };
-  if(peer&&!peer.destroyed&&peer.open){go();return;}
-  if(peer&&!peer.destroyed&&!peer.open){scheduleRetry();return;}
-  const me=new Peer(PEER_OPTS);peer=me;
-  me.on('open',()=>{if(peer===me)go();});
-  me.on('disconnected',()=>{if(peer!==me)return;setTimeout(()=>{try{if(!me.destroyed)me.reconnect();}catch(e){}},1500);});
-  me.on('error',err=>{if(peer!==me)return;if(err&&err.type==='peer-unavailable'){hostConn=null;live=false;playerOnPeers([]);scheduleRetry();return;}
-    if(err&&['network','server-error','socket-error','socket-closed'].indexOf(err.type)>=0){try{me.destroy();}catch(e){}peer=null;}scheduleRetry();});
+  // No answer either way after 12 s: if we reached the broker, the host got our offer and the direct link is failing.
+  attemptTimer=setTimeout(()=>{if(peer===me&&!(hostConn&&hostConn.open))fail(opened?'direct':'broker');},12000);
+  me.on('open',()=>{
+    if(peer!==me)return;
+    opened=true;connectAt=Date.now();
+    const c=me.connect(hostIdFor(P.code),{reliable:true});hostConn=c;
+    c.on('open',()=>{if(hostConn!==c)return;clearTimeout(attemptTimer);live=true;netErr=null;try{c.send({t:'p',pres:P.pres});}catch(e){}update();});
+    c.on('data',msg=>{if(hostConn!==c||!msg||msg.t!=='h'||!msg.pres)return;playerOnPeers([{presence:msg.pres,updatedAt:Date.now()}]);});
+    const lost=()=>{if(hostConn===c)fail('direct');};
+    c.on('close',lost);c.on('error',lost);
+  });
+  me.on('disconnected',()=>{
+    // Losing the broker while the game link is up is harmless: quietly re-register.
+    if(peer===me&&hostConn&&hostConn.open)setTimeout(()=>{try{if(!me.destroyed)me.reconnect();}catch(e){}},1500);
+  });
+  me.on('error',err=>{
+    if(peer!==me||(hostConn&&hostConn.open))return;
+    const type=err&&err.type;
+    fail(type==='peer-unavailable'?'nogame':type==='browser-incompatible'?'browser':type==='webrtc'?'direct':'broker');
+  });
 }
-function scheduleRetry(){clearTimeout(retryTimer);retryTimer=setTimeout(()=>{if(MODE==='player'&&P&&P.code&&!(hostConn&&hostConn.open))playerConnect();},2500);}
+/** Why can't this phone join? 'browser' | 'broker' | 'nogame' | 'direct' | 'wait' (no verdict yet). */
+function joinProblem(){return netErr||'wait';}
+/** Why isn't the big screen live? Returns null (fine or still connecting) | 'browser' | 'stuck'. */
+function hostProblem(){
+  if(live)return null;
+  if(hostFail==='browser-incompatible')return'browser';
+  return hostSince&&Date.now()-hostSince>8000?'stuck':null;
+}
+function scheduleRetry(){clearTimeout(retryTimer);retryTimer=setTimeout(()=>{if(MODE==='player'&&P&&P.code&&!(hostConn&&hostConn.open))playerConnect();},3000);}
 function pubPlayer(patch){
   Object.assign(P.pres,patch);
   if(hostConn&&hostConn.open){try{hostConn.send({t:'p',pres:P.pres});}catch(e){}}
@@ -113,7 +163,8 @@ function setScreen(html,key,prevKey){
 /* ================= home ================= */
 function statusLine(){
   if(roomState==='ok')return `<div class="status ok"><span class="dot"></span>No accounts or apps needed. Players use their phone’s browser.</div>`;
-  return `<div class="status bad"><span class="dot"></span>Couldn’t load the connection library. Check the internet connection and reload.</div>`;
+  if(roomState==='nortc')return `<div class="status bad"><span class="dot"></span>This browser can’t run Sketchy because it doesn’t support direct connections (WebRTC). Use Chrome, Edge, Safari or Firefox on a phone or computer. For a TV, open the game on a laptop and show the laptop’s screen on the TV.</div>`;
+  return `<div class="status bad"><span class="dot"></span>Couldn’t load the connection library. Check the internet connection and reload. Smart TV browsers often can’t load it: open the game on a laptop and show the laptop’s screen on the TV.</div>`;
 }
 function renderHome(){
   const k='home:'+roomState;if(k===homeKey)return;
@@ -312,6 +363,7 @@ function hBots(now){
 }
 function hTick(){
   if(hBots(Date.now())){hostPublish();hRender();}
+  if(S.phase==='lobby'){const nk=live+':'+hostProblem();if(nk!==S.netKey){S.netKey=nk;hRender();}}
   const now=Date.now();
   if(!S.paused){
     const ph=S.phase,d=cur();
@@ -394,11 +446,17 @@ lobby(){
   return `<section class="screen">${hHeader()}<div class="stage">
     <div class="col">
       <div class="eyebrow">Join on your phone</div>
-      <h1 class="htitle">${riso('Grab your phones')}</h1>
-      <div class="joinrow">${qrSvg(joinUrl())?`<figure class="qr" aria-label="QR code to join game ${esc(S.code)}">${qrSvg(joinUrl())}<figcaption>Scan to join</figcaption></figure>`:''}<div class="col" style="gap:.9rem">
+      <h1 class="htitle">${riso(live||!hostProblem()?'Grab your phones':'Hold on')}</h1>
+      ${live?`      <div class="joinrow">${qrSvg(joinUrl())?`<figure class="qr" aria-label="QR code to join game ${esc(S.code)}">${qrSvg(joinUrl())}<figcaption>Scan to join</figcaption></figure>`:''}<div class="col" style="gap:.9rem">
         <p class="hlede">Scan with your phone camera, or go to <b class="url">${esc(joinUrl(true))}</b> and enter the code.</p>
         <div class="code-letters" aria-label="Game code ${esc(S.code)}">${S.code.split('').map(c=>`<span>${c}</span>`).join('')}</div></div></div>
-      <p class="small">${live?'Ready for players. ':'Connecting the game screen… '}Being on the same Wi-Fi gives the smoothest connection.</p>
+      <p class="small">Ready for players. Being on the same Wi-Fi gives the smoothest connection.</p>`:hostProblem()?`<div class="card netwarn" role="alert">
+        <div class="pill fake">Not connected</div>
+        <div class="prompt-text">Phones can’t find this game yet</div>
+        <p>${hostProblem()==='browser'?'This browser can’t host a game because it doesn’t support direct connections.':'This screen hasn’t been able to reach the matchmaking service, so the join code isn’t active. Still trying…'}</p>
+        <p><b>Using a smart TV’s browser?</b> Most can’t host. Open the game in Chrome or Edge on a laptop and show the laptop’s screen on the TV with HDMI or casting.</p>
+        <p class="small">Otherwise check this device’s internet connection, turn off any VPN, and reload.${hostFail?' (Reason: '+esc(hostFail)+')':''}</p>
+      </div>`:`<p class="hlede">Connecting this screen… The join code appears as soon as it’s live.</p>`}
     </div>
     <div class="col panel">
       <div class="hblock"><div class="lbl">Players <span class="count">${n} of 10</span></div><div class="tiles">${tiles}</div></div>
@@ -537,7 +595,7 @@ function pKey(){
   if(roomState!=='ok')return'noroom';
   if(!P.code)return'join';
   const h=P.host;
-  if(!h)return P.joined?'lost':(Date.now()-P.joinAt<7000?'finding':'nohost');
+  if(!h)return P.joined?'lost':(Date.now()-P.joinAt<7000?'finding':'nohost:'+joinProblem());
   const inn=Array.isArray(h.in)&&h.in.indexOf(P.pid)>=0;
   if(!inn)return h.ph==='lobby'?'joining':'busy';
   P.joined=true;
@@ -572,7 +630,16 @@ join(){return `<section class="screen">
   <div class="actions"><button class="btn" data-act="pJoin">Join game</button><button class="btn quiet" data-act="goHome">Back</button></div>
 </section>`;},
 finding(){return `<section class="screen"><div class="spacer"></div><h2 class="title-m">Looking for game ${esc(P.code)}…</h2><p>Make sure the big screen is showing this code.</p><div class="spacer"></div></section>`;},
-nohost(){return `<section class="screen"><div class="spacer"></div><h2 class="title-m">Can’t find game ${esc(P.code)}</h2><p>Check the code on the big screen and make sure the game screen is still open. Still trying in the background…</p><div class="spacer"></div>
+nohost(){
+  const why=joinProblem(),code=esc(P.code);
+  const M={
+    nogame:['No game '+code+' is live','No big screen is hosting this code right now. Check the code, and check that the big screen shows a green <b>Live</b> in its top-right corner. Reloading the big screen makes a new code.'],
+    direct:['Found game '+code+', but can’t connect','This phone reached the game but couldn’t open a direct connection to the big screen. Put this phone on the <b>same Wi-Fi</b> as the big screen, switch off mobile data and any VPN, and avoid guest Wi-Fi.'],
+    broker:['Can’t reach the matchmaking service','This phone couldn’t reach the service that introduces phones to the big screen. Check its internet connection and turn off any VPN or ad blocker.'],
+    browser:['This browser can’t join','It doesn’t support direct connections. Open the game in Chrome, Safari, Edge or Firefox.'],
+    wait:['Still looking for game '+code,'This is taking longer than usual. Check the code on the big screen.']
+  }[why];
+  return `<section class="screen"><div class="spacer"></div><h2 class="title-m">${M[0]}</h2><p>${M[1]}</p><p class="small">${why==='browser'?'':'Still trying in the background…'}</p><div class="spacer"></div>
   <div class="actions"><button class="btn" data-act="pRetry">Try again</button><button class="btn quiet" data-act="pLeave">Change code</button></div></section>`;},
 joining(){return `<section class="screen"><div class="spacer"></div><h2 class="title-m">Joining…</h2><p>The big screen will show your name in a moment. If it doesn’t, the game may be full.</p><div class="spacer"></div>
   <div class="actions"><button class="btn quiet" data-act="pLeave">Change code</button></div></section>`;},
@@ -792,7 +859,7 @@ const A={
     Object.assign(P.pres,{role:'player',code,pid:P.pid,name,sk:null,fake:null,vote:null});
     playerConnect();pRender();
   },
-  pRetry(){P.joinAt=Date.now();playerConnect();pRender();},
+  pRetry(){P.joinAt=Date.now();netErr=null;playerConnect();pRender();},
   pLeave(){pubPlayer({role:null,code:null,sk:null,fake:null,vote:null});killPeer();P.code=null;P.joined=false;P.host=null;P.upload=null;pRender(true);},
   pFake(){
     const h=P.host;if(!h||h.ph!=='fake')return;
